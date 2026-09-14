@@ -6,11 +6,11 @@
 #   产出：systemd 服务 + 完整 config.json + 客户端分享链接 + BBR 加速
 #
 # 用法（一行）：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<你的仓库>/main/install-xray.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/harodggg/xray-deploy/main/install-xray.sh)
 #
 # 常用参数：
 #   --port 8443              监听端口（默认 443）
-#   --sni www.cloudflare.com REALITY 伪装目标域名（默认 www.cloudflare.com）
+#   --sni www.amazon.com     REALITY 伪装目标域名（默认自动探测，见 README）
 #   --encryption             叠加 VLESS Encryption（后量子加密，需 v26.3.27+ 客户端）
 #   --xhttp                  改用 XHTTP + REALITY（抗 QoS 更好）
 #   --mldsa65                叠加 REALITY 后量子签名（目标站点证书须 >3500 字节）
@@ -240,7 +240,7 @@ preflight() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 usage() {
-  sed -n '3,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
 }
 

@@ -19,8 +19,8 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/harodggg/xray-deploy/main/install-xray.sh)
 ```
 
-> 上面的地址是**示例格式**。脚本需要先托管到你自己的仓库（见文末「发布到自己的仓库」），
-> 把 `<用户名>/<仓库>` 换成你的即可。
+> 仓库需为 **Public**，`raw.githubusercontent.com` 才能取到脚本。
+> 若使用私有仓库，请参考文末「发布到自己的仓库」中的自建分发方式。
 
 ### 2. 另一种等价写法（先下载再执行，便于审查）
 

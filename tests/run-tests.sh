@@ -74,10 +74,12 @@ case "${1:-}" in
   *)  echo Linux ;;
 esac'
 
-# 伪造 systemd：记录调用，is-active 恒为活跃
+# 伪造 systemd：记录调用；is-active 依据 MOCK_SVC_STATE 决定退出码
 write_mock systemctl '#!/usr/bin/env bash
 echo "systemctl $*" >> "${MOCK_LOG}"
-[[ "${1:-}" == "is-active" ]] && exit 0
+if [[ "${1:-}" == "is-active" ]]; then
+  [[ "${MOCK_SVC_STATE:-active}" == "active" ]] && exit 0 || exit 3
+fi
 exit 0'
 
 # 伪造 sysctl：报告支持 BBR
@@ -122,6 +124,7 @@ run_installer() {
     HOME="$SANDBOX" \
     TMPDIR="${SANDBOX}" \
     MOCK_LOG="$MOCK_LOG" \
+    MOCK_SVC_STATE="${MOCK_SVC_STATE:-active}" \
     XRAY_INIT_OVERRIDE="${INIT_OVERRIDE:-systemd}" \
     XRAY_BIN="${BIN}/xray" \
     XRAY_DAT="$DATDIR" \
@@ -386,8 +389,35 @@ clean < "$OUT3" | grep -q "$(jq -r '.inbounds[0].settings.clients[0].id' "$CFG")
   && pass '--links 与磁盘配置一致' || fail '--links 与配置不一致'
 
 # ═══════════════════════════════════════════════════════════════════════════
+head_ '10. --check 健康检查'
+OUT5="${SANDBOX}/check.out"
+run_installer --check > "$OUT5" 2>&1
+[[ $? -eq 0 ]] && pass '--check 退出码 0' || { fail '--check 失败'; tail -15 "$OUT5" | sed 's/^/    /'; }
+CHECK_TXT="$(clean < "$OUT5")"
+if grep -q '服务状态：运行中' <<<"$CHECK_TXT"; then
+  pass '正确识别 systemd 服务为运行中'
+else
+  fail '服务状态判定错误'
+  printf '%s\n' "$CHECK_TXT" | grep -n '服务状态' | sed 's/^/    /'
+  printf '%s\n' "$CHECK_TXT" | sed -n '1,12p' | sed 's/^/    | /'
+fi
+grep -q '内核版本：' <<<"$CHECK_TXT" && pass '报告内核版本' || fail '未报告内核版本'
+grep -q '配置校验：通过' <<<"$CHECK_TXT" && pass '配置校验通过' || fail '配置校验未通过'
+grep -q '拥塞控制：bbr' <<<"$CHECK_TXT" && pass '报告 BBR 已开启' || fail '未报告 BBR'
+grep -q '本机 → ' <<<"$CHECK_TXT" && pass '实测伪装目标延迟' || fail '未实测延迟'
+printf '%s\n' "$CHECK_TXT" | grep -qE '[0-9]+ ms' && pass '延迟以毫秒数值给出' || fail '延迟无数值'
+
+# 服务停止时必须给出警告而不是谎报正常
+# 注意：变量赋值前缀不会传入 run_installer 内部的 env -i，必须显式 export
+export MOCK_SVC_STATE=stopped
+CHECK_STOP="$(run_installer --check 2>&1 | clean)"
+export MOCK_SVC_STATE=active
+grep -q '服务状态：inactive' <<<"$CHECK_STOP" && pass '服务停止时正确告警' \
+  || fail '服务停止时未告警'
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 卸载必须放在最后：它会删掉内核，后续用例会因此失去验签能力
-head_ '10. 卸载流程'
+head_ '11. 卸载流程'
 OUT4="${SANDBOX}/uninstall.out"
 run_installer --uninstall > "$OUT4" 2>&1
 [[ $? -eq 0 ]] && pass '卸载退出码 0' || { fail '卸载失败'; tail -12 "$OUT4" | sed 's/^/    /'; }

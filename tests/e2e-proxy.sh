@@ -204,6 +204,39 @@ echo
 if [[ $CURL_RC -eq 0 && -n "$RESP" ]]; then
   printf '%s\n' "$RESP" | head -8 | sed 's/^/    /'
   echo
+
+  # ── 量化隧道开销 ──
+  # 远端站点本身抖动很大（实测 ±200ms），单次采样没有意义：
+  # 这里 (1) 单独测「连接建立」开销，(2) 对 TTFB 多次采样取中位数
+  median() { sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "n/a"} else if(NR%2){printf "%.1f", a[(NR+1)/2]*1000} else {printf "%.1f", (a[NR/2]+a[NR/2+1])/2*1000} }'; }
+
+  # (1) 连接建立：直连 vs 经隧道（都打同一个远端，差值即隧道握手开销）
+  C_DIR=''; C_TUN=''
+  for _ in 1 2 3 4 5 6 7; do
+    C_DIR="${C_DIR}$(curl -sS -o /dev/null -m 20 -w '%{time_connect}\n' "$PROBE_URL" 2>/dev/null)\n"
+    C_TUN="${C_TUN}$(curl -sS -o /dev/null -m 20 -w '%{time_appconnect}\n' --socks5-hostname "127.0.0.1:${SOCK_PORT}" "$PROBE_URL" 2>/dev/null)\n"
+  done
+  M_DIR="$(printf "$C_DIR" | grep -E '^[0-9]' | median)"
+  M_TUN="$(printf "$C_TUN" | grep -E '^[0-9]' | median)"
+
+  # (2) 首字节时间：多次采样取中位数，抵消远端抖动
+  T_DIR=''; T_TUN=''
+  for _ in 1 2 3 4 5 6 7; do
+    T_DIR="${T_DIR}$(curl -sS -o /dev/null -m 20 -w '%{time_starttransfer}\n' "$PROBE_URL" 2>/dev/null)\n"
+    T_TUN="${T_TUN}$(curl -sS -o /dev/null -m 20 -w '%{time_starttransfer}\n' --socks5-hostname "127.0.0.1:${SOCK_PORT}" "$PROBE_URL" 2>/dev/null)\n"
+  done
+  N_DIR="$(printf "$T_DIR" | grep -E '^[0-9]' | median)"
+  N_TUN="$(printf "$T_TUN" | grep -E '^[0-9]' | median)"
+
+  echo '── 延迟量化（7 次采样取中位数）──'
+  printf '  建连 直连 %s ms  →  经隧道 %s ms\n' "$M_DIR" "$M_TUN"
+  printf '  首字节 直连 %s ms  →  经隧道 %s ms\n' "$N_DIR" "$N_TUN"
+  awk -v a="$M_TUN" -v b="$M_DIR" -v c="$N_TUN" -v d="$N_DIR" 'BEGIN{
+    if (a!="n/a" && b!="n/a") printf "  建连额外开销   : %+.1f ms\n", a-b;
+    if (c!="n/a" && d!="n/a") printf "  首字节额外开销 : %+.1f ms\n", c-d }'
+  echo '  （本机回环，不含跨网延迟；反映协议与服务端处理开销）'
+  echo
+
   echo '✅ 端到端代理成功：安装脚本产出的配置可真实承载流量'
   kill "$SRV_PID" "$CLI_PID" 2>/dev/null
   exit 0

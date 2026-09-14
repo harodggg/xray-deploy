@@ -18,6 +18,7 @@
 #   --client-config <文件>   同时生成配套客户端配置
 #   --uninstall              完全卸载
 #   --links                  仅打印分享链接
+#   --check                  健康检查与延迟实测（判断节点快慢用这个）
 #   --update                 升级内核到最新版并保留配置
 #
 # 支持：Debian/Ubuntu、CentOS/RHEL/Rocky/Alma、Fedora、Arch、Alpine(OpenRC)、openSUSE
@@ -240,7 +241,7 @@ preflight() {
 # ═══════════════════════════════════════════════════════════════════════════
 
 usage() {
-  sed -n '3,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -258,6 +259,7 @@ parse_args() {
       --uninstall)  ACTION='uninstall'; shift ;;
       --client-config) CLIENT_CONF="${2:-}"; [[ -n "$CLIENT_CONF" ]] || die '--client-config 需要指定文件路径'; shift 2 ;;
       --links)      ACTION='links'; shift ;;
+      --check)      ACTION='check'; shift ;;
       --update)     ACTION='update'; shift ;;
       -h|--help)    usage ;;
       *) die "未知参数：$1（用 --help 查看用法）" ;;
@@ -1124,6 +1126,113 @@ EOF
   warn '记得把里面的 SERVER_ADDRESS 替换为你的服务器地址'
 }
 
+# ── 健康检查 ────────────────────────────────────────────────────────────────
+# 回答「这个节点快不快、稳不稳」：先看本机状态，再实测到伪装目标的往返延迟
+# 与握手耗时，最后给出口径明确的结论。
+svc_info() {
+  # 注意：systemctl is-active 的 stdout 只是给人看的文本，判定依据是退出码
+  if [[ "$INIT_SYS" == 'systemd' ]]; then
+    if systemctl is-active --quiet xray 2>/dev/null; then printf 'active'; else printf 'inactive'; fi
+  else
+    if rc-service xray status >/dev/null 2>&1; then printf 'active'; else printf 'inactive'; fi
+  fi
+}
+
+tcp_ping() { # tcp_ping <host> <port> —— 用 curl 的建连耗时近似 RTT
+  local host="$1" port="$2" i best='' cur
+  for i in 1 2 3 4 5; do
+    cur="$(curl -sS -o /dev/null -m 8 -w '%{time_connect}' \
+            "telnet://${host}:${port}" 2>/dev/null || true)"
+    [[ -z "$cur" ]] && continue
+    if [[ -z "$best" ]] || awk -v a="$cur" -v b="$best" 'BEGIN{exit !(a<b)}'; then best="$cur"; fi
+  done
+  [[ -n "$best" ]] && awk -v v="$best" 'BEGIN{printf "%.0f", v*1000}'
+}
+
+do_check() {
+  banner
+  detect_init
+  detect_pkg
+  load_state
+  step '节点健康检查'
+
+  # 1. 本机状态
+  local st; st="$(svc_info)"
+  if [[ "$st" == 'active' ]]; then ok "服务状态：运行中"
+  else warn "服务状态：${st:-未知}（可执行 systemctl restart xray）"; fi
+
+  if [[ -x "$XRAY_BIN" ]]; then
+    ok "内核版本：$("$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}')"
+  else
+    warn "内核文件缺失：${XRAY_BIN}"; fi
+
+  if [[ -f "$XRAY_CONF" ]]; then
+    if XRAY_LOCATION_ASSET="$XRAY_DAT" "$XRAY_BIN" run -test -config "$XRAY_CONF" >/dev/null 2>&1; then
+      ok '配置校验：通过'
+    else
+      warn '配置校验：未通过（执行 xray run -test -config '"$XRAY_CONF"' 查看详情）'
+    fi
+  else
+    warn "配置文件缺失：${XRAY_CONF}"; fi
+
+  local listening=0
+  if have ss && ss -lnt 2>/dev/null | grep -q ":${PORT} "; then listening=1
+  elif have netstat && netstat -lnt 2>/dev/null | grep -q ":${PORT} "; then listening=1
+  elif (echo > "/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then listening=1; fi
+  if [[ "$listening" -eq 1 ]]; then ok "监听端口 ${PORT}：正常"
+  else warn "监听端口 ${PORT}：未监听"; fi
+
+  printf '  端口        : %s\n' "$PORT"
+  printf '  伪装目标    : %s\n' "$SNI"
+  printf '  传输 / 流控 : %s / xtls-rprx-vision\n' "${NETWORK:-tcp}"
+  if [[ "${VLESS_DECRYPTION:-none}" != 'none' && -n "${VLESS_DECRYPTION:-}" ]]; then
+    printf '  VLESS 加密  : 已启用（后量子）\n'
+  else
+    printf '  VLESS 加密  : 未启用\n'
+  fi
+
+  # 2. 到伪装目标的延迟（决定首包与握手快慢）
+  step '延迟实测'
+  local t
+  t="$(tcp_ping "$SNI" 443)"
+  if [[ -n "$t" ]]; then
+    ok "本机 → ${SNI}  TCP 建连：${t} ms"
+    if   [[ "$t" -lt 30 ]]; then say '  评价：极佳（同区域机房）'
+    elif [[ "$t" -lt 80 ]]; then say '  评价：良好'
+    elif [[ "$t" -lt 150 ]]; then say '  评价：一般，握手会偏慢'
+    else say '  评价：偏高，建议换离你更近的机房'; fi
+  else
+    warn "无法连通 ${SNI}:443 —— 伪装目标不可达会导致客户端握手失败，建议更换 --sni"
+  fi
+
+  # 3. BBR 与队列算法（决定吞吐上限，尤其跨洋高延迟链路）
+  step '内核加速状态'
+  local cc qd
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '读取失败')"
+  qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '读取失败')"
+  if [[ "$cc" == 'bbr' ]]; then ok "拥塞控制：bbr"
+  else warn "拥塞控制：${cc}（建议开启 BBR：xctl 重跑部署或手工 sysctl）"; fi
+  if [[ "$qd" == 'fq' || "$qd" == 'fq_codel' || "$qd" == 'cake' ]]; then ok "队列算法：${qd}"
+  else warn "队列算法：${qd}（BBR 建议配 fq）"; fi
+
+  # 4. 服务端出口带宽参考（下载 10MB 测速）
+  step '出口带宽参考'
+  local dl
+  dl="$(curl -sS -o /dev/null -m 25 -w '%{speed_download}' \
+        'https://speed.cloudflare.com/__down?bytes=10485760' 2>/dev/null || true)"
+  if [[ -n "$dl" ]] && awk -v v="$dl" 'BEGIN{exit !(v>0)}'; then
+    awk -v v="$dl" 'BEGIN{printf "  本机下载速度：%.1f MB/s（%.0f Mbps）\n", v/1048576, v*8/1000000}'
+    say '  说明：这是机房到测速点的速度，客户端实际速度还取决于你与机房之间的线路'
+  else
+    warn '测速失败（可能出网受限），跳过'
+  fi
+
+  say ''
+  say '如需更换更快的伪装目标：'
+  say "  bash ${SELF_COPY} --sni <更快的目标域名>"
+  say ''
+}
+
 print_links() {
   load_state
   PUB="${PUB:-$( "$XRAY_BIN" x25519 -i "$PRIV" 2>/dev/null | sed -n 's/^Password (PublicKey): //p' | head -n1)}"
@@ -1260,6 +1369,7 @@ do_update() {
 do_uninstall() {
   banner
   require_root
+  detect_init
   step '卸载 Xray'
   svc_stop
   if [[ "$INIT_SYS" == 'systemd' ]]; then
@@ -1295,6 +1405,7 @@ main() {
     update)    require_root; do_update ;;
     uninstall) require_root; do_uninstall ;;
     links)     require_root; print_links ;;
+    check)     require_root; do_check ;;
     *)         die "未知动作：${ACTION}" ;;
   esac
 }
